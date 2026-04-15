@@ -1,11 +1,8 @@
 """
-AI-analysaattori – Claude Haiku + web search käytetyille hinnoille.
+AI-analysaattori – Claude Haiku + nopea web-hinta.
 
-Ensin haetaan oikeat käytetyt hinnat netistä (Hintaseuranta, Pricespy,
-Google Shopping), sitten Claude arvioi realistisen myyntihinnan
-oikean markkinadatan pohjalta.
-
-Kustannus per ilmoitus: ~0.0005–0.001 € (web search + analyysi)
+KORJAUS: Vain 1 web-haku per ilmoitus (Huuto.net) entisen 3:n sijaan.
+→ Nopea, ei aikakatkaisuriskiä, silti oikeaa markkinadataa.
 """
 import json
 import logging
@@ -36,11 +33,8 @@ Ilmoitus:
 - Sijainti: {location}
 - Kuvaus:   {description}
 
-Käytettyjen tuotteiden markkinahintatiedot netistä:
+Käytettyjen tuotteiden markkinahintatiedot (Huuto.net ja muu verkko):
 {market_data}
-
-Arvioi realistinen myyntihinta OTTAEN HUOMIOON yllä oleva markkinadata.
-Jos markkinadata on tyhjä tai epäluotettava, käytä omaa tietämystäsi.
 
 Palauta AINOASTAAN validi JSON – ei markdown-koodia, ei muuta tekstiä:
 {{
@@ -48,7 +42,7 @@ Palauta AINOASTAAN validi JSON – ei markdown-koodia, ei muuta tekstiä:
   "product_category": "elektroniikka" tai "urheilu" tai "kodinkoneet" tai "muu",
   "condition_score": <1–5: 1=rikki, 2=huono, 3=toimiva, 4=hyvä, 5=erinomainen>,
   "condition_reasoning": "1–2 lausetta",
-  "estimated_resale_price": <realistinen myyntihinta tori.fi:ssä nyt, kokonaisluku euroina>,
+  "estimated_resale_price": <realistinen myyntihinta tori.fi:ssä nyt euroina, kokonaisluku>,
   "resale_reasoning": "1–2 lausetta – mainitse jos pohjautuu markkinadataan",
   "red_flags": "varoitusmerkit tai 'ei huomautettavaa'"
 }}\
@@ -58,7 +52,7 @@ Palauta AINOASTAAN validi JSON – ei markdown-koodia, ei muuta tekstiä:
 class ListingAnalyzer:
     MODEL      = "claude-haiku-4-5-20251001"
     MAX_TOKENS = 700
-    TIMEOUT    = 10
+    TIMEOUT    = 8
 
     def __init__(self, config):
         self.client = anthropic.Anthropic(api_key=config.anthropic_api_key)
@@ -70,16 +64,15 @@ class ListingAnalyzer:
             else f"{listing['price']}€"
         )
 
-        # 1) Hae käytettyjen hinnat netistä
-        product_hint = listing.get("title", "")
-        market_data  = self._fetch_used_prices(product_hint)
+        query       = self._clean_query(listing.get("title", ""))
+        market_data = self._fetch_used_price(query)
 
         prompt = PROMPT.format(
             title       = (listing.get("title") or "")[:120],
             price       = price_str,
             location    = (listing.get("location") or "")[:60],
             description = (listing.get("description") or "")[:400],
-            market_data = market_data or "Ei markkinadataa saatavilla.",
+            market_data = market_data or "Ei markkinadataa saatavilla – arvioi oman tietämyksesi perusteella.",
         )
 
         try:
@@ -88,9 +81,8 @@ class ListingAnalyzer:
                 max_tokens = self.MAX_TOKENS,
                 messages   = [{"role": "user", "content": prompt}],
             )
-
-            raw = response.content[0].text.strip()
-            raw = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+            raw  = response.content[0].text.strip()
+            raw  = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
             data = json.loads(raw)
 
             for key in ("product_name_normalized", "condition_score", "estimated_resale_price"):
@@ -109,114 +101,60 @@ class ListingAnalyzer:
             logger.error(f"Anthropic API-virhe: {exc}")
             return None
         except Exception as exc:
-            logger.error(f"Tuntematon virhe analyysissa: {exc}", exc_info=True)
+            logger.error(f"Analyysivirhe: {exc}", exc_info=True)
             return None
 
-    # ── Käytettyjen hintojen haku ─────────────────────────────────────────
+    # ── Yksi nopea web-haku ───────────────────────────────────────────────
 
-    def _fetch_used_prices(self, product_name: str) -> str:
+    def _fetch_used_price(self, query: str) -> str | None:
         """
-        Hakee käytettyjen tuotteiden hintoja useasta lähteestä.
-        Palauttaa tekstiyhteenvedon Claudelle syötettäväksi.
+        Hakee käytettyjen hinnat Huuto.netistä.
+        Nopea (1 pyyntö), hyvä suomalainen data.
         """
-        if not product_name or len(product_name) < 4:
-            return ""
+        if not query or len(query) < 3:
+            return None
+        try:
+            resp = requests.get(
+                "https://www.huuto.net/haku",
+                params={"sana": query, "sivu": 1},
+                headers=HEADERS,
+                timeout=self.TIMEOUT,
+            )
+            resp.raise_for_status()
+            soup   = BeautifulSoup(resp.text, "html.parser")
+            prices = self._extract_prices(soup.get_text())
 
-        query = self._clean_query(product_name)
-        results = []
+            if not prices:
+                return None
 
-        sources = [
-            ("Hintaseuranta.fi", self._hintaseuranta),
-            ("Huuto.net",        self._huuto),
-            ("Google Shopping",  self._google_shopping),
-        ]
+            prices_sorted = sorted(p for p in prices if 3 < p < 30_000)
+            if not prices_sorted:
+                return None
 
-        for name, fn in sources:
-            try:
-                data = fn(query)
-                if data:
-                    results.append(f"[{name}]: {data}")
-                time.sleep(0.5)
-            except Exception as exc:
-                logger.debug(f"  {name} haku epäonnistui: {exc}")
-
-        if not results:
-            return ""
-
-        return "\n".join(results)
-
-    def _hintaseuranta(self, query: str) -> str | None:
-        """Hintaseuranta.fi – suomalainen hintavertailu."""
-        resp = requests.get(
-            "https://www.hintaseuranta.fi/haku",
-            params={"q": query},
-            headers=HEADERS,
-            timeout=self.TIMEOUT,
-        )
-        resp.raise_for_status()
-        soup  = BeautifulSoup(resp.text, "html.parser")
-        prices = self._extract_prices_from_soup(soup)
-        if prices:
-            median = sorted(prices)[len(prices) // 2]
-            return f"Uutena ~{median}€ (mediaani {len(prices)} tuloksesta)"
-        return None
-
-    def _huuto(self, query: str) -> str | None:
-        """Huuto.net – suomalainen huutokauppa, hyvä käytettyjen hinnoille."""
-        resp = requests.get(
-            "https://www.huuto.net/haku",
-            params={"sana": query, "sivu": 1},
-            headers=HEADERS,
-            timeout=self.TIMEOUT,
-        )
-        resp.raise_for_status()
-        soup   = BeautifulSoup(resp.text, "html.parser")
-        prices = self._extract_prices_from_soup(soup)
-        if prices:
-            prices_sorted = sorted(prices)
             low    = prices_sorted[0]
-            high   = prices_sorted[-1]
             median = prices_sorted[len(prices_sorted) // 2]
-            return f"Käytettynä: alin {low}€ / mediaani {median}€ / korkein {high}€ ({len(prices)} myyntiä)"
-        return None
+            high   = prices_sorted[-1]
+            n      = len(prices_sorted)
+            return (
+                f"Huuto.net ({n} myyntiä): alin {low}€ / mediaani {median}€ / korkein {high}€"
+            )
 
-    def _google_shopping(self, query: str) -> str | None:
-        """
-        Google Shopping -haku käytetyille tuotteille.
-        Hakee 'käytetty [tuote] hinta' -termillä.
-        """
-        search_query = f"{query} käytetty hinta"
-        resp = requests.get(
-            "https://www.google.fi/search",
-            params={"q": search_query, "tbm": "shop", "hl": "fi"},
-            headers=HEADERS,
-            timeout=self.TIMEOUT,
-        )
-        resp.raise_for_status()
-        soup   = BeautifulSoup(resp.text, "html.parser")
-        prices = self._extract_prices_from_soup(soup)
-        if prices:
-            prices_sorted = sorted(p for p in prices if p > 5)[:10]
-            if prices_sorted:
-                median = prices_sorted[len(prices_sorted) // 2]
-                return f"Google Shopping käytetty: ~{median}€ (mediaani)"
-        return None
+        except requests.RequestException as exc:
+            logger.debug(f"Huuto.net haku epäonnistui: {exc}")
+            return None
+        except Exception as exc:
+            logger.debug(f"Hintahaku virhe: {exc}")
+            return None
 
     # ── Apumetodit ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _extract_prices_from_soup(soup: BeautifulSoup) -> list[int]:
+    def _extract_prices(text: str) -> list[int]:
         prices = []
-        text   = soup.get_text()
-        for m in re.finditer(r"(\d[\d\s]{0,5})[,\.](\d{2})\s*€", text):
+        for m in re.finditer(r"(?<!\d)(\d{1,5})\s*€", text):
             try:
-                prices.append(int(m.group(1).replace(" ", "")))
-            except ValueError:
-                pass
-        for m in re.finditer(r"(\d[\d\s]{0,5})\s*€", text):
-            try:
-                val = int(m.group(1).replace(" ", ""))
-                if 5 < val < 50_000:
+                val = int(m.group(1))
+                if 3 < val < 30_000:
                     prices.append(val)
             except ValueError:
                 pass
@@ -227,7 +165,7 @@ class ListingAnalyzer:
         name = re.sub(r"\([^)]*\)", "", name)
         junk = re.compile(
             r"\b(myydään|hyvä|kunto|toimiva|käytetty|uusi|uutta|vastaava|"
-            r"halpa|tarjous|ilmainen|myynnissä|vaihto)\b",
+            r"halpa|tarjous|ilmainen|myynnissä|vaihto|etsitään|ostetaan)\b",
             re.IGNORECASE,
         )
         name = junk.sub("", name).strip()
