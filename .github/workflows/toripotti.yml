@@ -8,7 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 20   # Nostettu 8 → 20 min (11 emailia × useita ilmoituksia)
 
     steps:
       - name: Hae koodi
@@ -25,6 +25,7 @@ jobs:
 
       - name: Aja Toripotti
         env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
           IMAP_USER:         ${{ secrets.IMAP_USER }}
           IMAP_PASSWORD:     ${{ secrets.IMAP_PASSWORD }}
           SMTP_USER:         ${{ secrets.SMTP_USER }}
