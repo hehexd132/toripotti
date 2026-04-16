@@ -1,8 +1,13 @@
 """
 Toripotti – automaattinen tori.fi-hakuvahtien analysaattori
+
+KORJAUS: 2 sekunnin tauko ennen jokaista Claude-kutsua →
+vältetään 429-virheet jotka aiheuttivat 5-6 sek retryt ja 20 min ylityksen.
 """
 import logging
 import sys
+import time
+
 from toripotti.config import Config
 from toripotti.gmail_reader import GmailReader
 from toripotti.email_parser import ToriEmailParser
@@ -17,6 +22,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Tauko Claude-kutsujen välillä – estää 429-virheet
+# Ilman taukoa retry vie 5-6 sek, tällä tauolla se on 2 sek → nopeampi
+CLAUDE_RATE_LIMIT_SLEEP = 2.0
+
 
 def process_listing(listing, fetcher, analyzer, alerter, config) -> bool:
     price_display = (
@@ -25,6 +34,9 @@ def process_listing(listing, fetcher, analyzer, alerter, config) -> bool:
         else        f"{listing['price']}€"
     )
     logger.info(f"    📦 [{price_display}] {listing['title'][:70]}")
+
+    # Pieni tauko ennen Claude-kutsua – välttää 429 rate limit -virheet
+    time.sleep(CLAUDE_RATE_LIMIT_SLEEP)
 
     analysis = analyzer.analyze(listing)
     if not analysis:
