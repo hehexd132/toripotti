@@ -1,8 +1,8 @@
 """
 Tori.fi hakuvahti -emailin parsija.
-Käsittelee sekä yksittäiset ilmoitukset että digest-emailit.
 
-KORJAUS: FREE_RE ei enää sisällä 0€ → ei enää väärennä hintoja.
+KORJAUS: URL-deduplikointi – sama ilmoitus ei enää analysoida kahdesti
+vaikka linkki esiintyisi emailissa sekä kuvana että tekstinä.
 """
 import re
 import logging
@@ -15,26 +15,24 @@ TURKU_AREA = {
     "masku", "nousiainen", "mynämäki", "rusko", "paimio",
 }
 
-# Hinta: "150 €", "1 299€", "1299,00 €"
 PRICE_RE = re.compile(
-    r"(?<!\d)(\d{1,5}(?:[\s\u00a0]\d{3})?)"   # 1–5 numeroa, mahdollinen tuhaterottaja
-    r"(?:[,\.]\d{2})?"                           # desimaalit (valinnainen)
+    r"(?<!\d)(\d{1,5}(?:[\s\u00a0]\d{3})?)"
+    r"(?:[,\.]\d{2})?"
     r"\s*€",
     re.IGNORECASE,
 )
-
-# Ilmainen: VAIN sanamuotoja – EI enää "0 €" joka osui virheellisesti "150€":een
-FREE_RE = re.compile(r"\bilmainen\b|\bilmaiseksi\b|\bgratis\b", re.IGNORECASE)
-
-# Tori.fi-linkki
+FREE_RE  = re.compile(r"\bilmainen\b|\bilmaiseksi\b|\bgratis\b", re.IGNORECASE)
 TORI_URL = re.compile(r"https?://(?:www\.)?tori\.fi/[^\s\"'<>\)]+", re.IGNORECASE)
-
-# Rivit joita ei käytetä otsikkona
-SKIP_RE = re.compile(
+SKIP_RE  = re.compile(
     r"tori\.fi|hakuvahti|peruuta|unsubscribe|tilauksen|ilmoittaudu|"
     r"klikkaa|katso\s+ilmoitus|näytä\s+ilmoitus|avaa\s+ilmoitus",
     re.IGNORECASE,
 )
+
+
+def _normalize_url(url: str) -> str:
+    """Poistaa tracking-parametrit URL:sta deduplikointia varten."""
+    return url.split("?")[0].split("#")[0].rstrip("/")
 
 
 class ToriEmailParser:
@@ -61,7 +59,8 @@ class ToriEmailParser:
             if single:
                 listings = [single]
 
-        logger.info(f"  📋 Emailissa {len(listings)} ilmoitusta")
+        count = len(listings)
+        logger.info(f"  📋 Emailissa {count} ilmoitusta")
         return listings
 
     # ── HTML ──────────────────────────────────────────────────────────────
@@ -69,18 +68,20 @@ class ToriEmailParser:
     def _from_html_multi(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "html.parser")
 
-        # Kerää kaikki tori.fi-ilmoituslinkit
-        tori_links = []
+        # Kerää UNIIKIT tori.fi-ilmoituslinkit
+        # Sama ilmoitus voi esiintyä sekä kuvalinkkinä että tekstilinkkinä –
+        # deduplikointi estää kaksinkertaisen analysoinnin
         seen_urls  = set()
+        tori_links = []
+
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            # Ilmoituslinkit sisältävät /ilmoitus/ tai pitkän numerosarjan
             if "tori.fi" in href and re.search(r"/\d{5,}|/ilmoitus", href):
-                # Poista tracking-parametrit URL:sta vertailua varten
-                base = href.split("?")[0]
+                base = _normalize_url(href)
                 if base not in seen_urls:
                     seen_urls.add(base)
                     tori_links.append((a, href))
+                # else: sama URL jo listassa, ohitetaan
 
         if not tori_links:
             return []
@@ -90,20 +91,18 @@ class ToriEmailParser:
             listing = self._extract_near_link(anchor, url)
             if listing and listing.get("title"):
                 listings.append(listing)
-                logger.debug(f"    → [{listing['price']}€] {listing['title'][:60]}")
+                p = listing["price"]
+                price_str = "ILMAINEN" if p == 0 else ("?" if p < 0 else f"{p}€")
+                logger.debug(f"    → [{price_str}] {listing['title'][:60]}")
 
         return listings
 
     def _extract_near_link(self, anchor, url: str) -> dict | None:
-        """
-        Poimii ilmoitustiedot linkin läheltä DOM-puussa.
-        Käy ylöspäin vanhempiin kunnes löytää otsikon ja hinnan.
-        """
         title = price = location = None
         description = ""
 
         container = anchor
-        for depth in range(6):
+        for _ in range(6):
             parent = container.parent
             if parent is None or parent.name in ("body", "html", "[document]"):
                 break
@@ -118,11 +117,9 @@ class ToriEmailParser:
             if len(lines) < 2:
                 continue
 
-            # Parsitaan rivit
             for line in lines:
                 ll = line.lower()
 
-                # Hinta – tarkista ensin ilmainen-sanat
                 if price is None:
                     if FREE_RE.search(line):
                         price = 0
@@ -135,27 +132,24 @@ class ToriEmailParser:
                             except ValueError:
                                 pass
 
-                # Sijainti
                 if location is None:
                     for city in TURKU_AREA:
                         if city in ll:
                             location = line
                             break
 
-                # Otsikko – ensimmäinen järkevä rivi
                 if title is None:
                     if not SKIP_RE.search(line) and not re.match(r"^[\d\s€,\.\-–]+$", line):
                         if len(line) > 4 and "@" not in line:
                             title = line
                             continue
 
-                # Kuvaus
                 if title and not description and line != title:
                     if not re.match(r"^[\d\s€,\.\-–]+$", line) and "@" not in line:
                         description = line
 
             if title and price is not None:
-                break  # Löydettiin riittävästi tietoa
+                break
 
         if not title:
             return None
@@ -171,11 +165,18 @@ class ToriEmailParser:
     # ── Teksti-email ──────────────────────────────────────────────────────
 
     def _from_text_multi(self, text: str) -> list[dict]:
-        urls     = TORI_URL.findall(text)
+        raw_urls = TORI_URL.findall(text)
         segments = re.split(r"https?://(?:www\.)?tori\.fi/[^\s]+", text)
-        listings = []
 
-        for i, url in enumerate(urls):
+        seen_urls = set()
+        listings  = []
+
+        for i, url in enumerate(raw_urls):
+            base = _normalize_url(url)
+            if base in seen_urls:
+                continue
+            seen_urls.add(base)
+
             segment = segments[i] if i < len(segments) else ""
             lines   = [l.strip() for l in segment.split("\n") if l.strip() and len(l.strip()) > 2]
 
@@ -223,12 +224,12 @@ class ToriEmailParser:
     def _single_fallback(self, content: str, subject: str) -> dict | None:
         if not content:
             return None
-        soup = BeautifulSoup(content, "html.parser") if "<" in content else None
-        text = soup.get_text(separator="\n") if soup else content
+        soup  = BeautifulSoup(content, "html.parser") if "<" in content else None
+        text  = soup.get_text(separator="\n") if soup else content
         url_m = TORI_URL.search(content)
         url   = url_m.group(0) if url_m else None
-        lines = [l.strip() for l in text.split("\n") if l.strip() and len(l.strip()) > 2]
 
+        lines = [l.strip() for l in text.split("\n") if l.strip() and len(l.strip()) > 2]
         title = price = location = None
         desc  = []
 
