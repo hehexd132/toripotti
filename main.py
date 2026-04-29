@@ -1,8 +1,14 @@
 """
-Toripotti – automaattinen tori.fi-hakuvahtien analysaattori
+Toripotti v5 – kategoriakohtaiset kynnykset + erätunnistus
 
-KORJAUS: 2 sekunnin tauko ennen jokaista Claude-kutsua →
-vältetään 429-virheet jotka aiheuttivat 5-6 sek retryt ja 20 min ylityksen.
+Kynnykset:
+  elektroniikka  → 60% + 25€  (Apple-tuotteet yliarvioituvat helposti)
+  urheilu        → 40% + 15€  (merkkiurheiluvälineet myyvät hyvin)
+  kodinkoneet    → 45% + 20€
+  muu            → 40% + 15€  (lievennettty yleiskynnys)
+
+Erätarjoukset (is_bulk=True):
+  → Kynnys puolitetaan – 2 kpl tavaraa pienellä hinnalla on usein hyvä diili
 """
 import logging
 import sys
@@ -22,9 +28,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Tauko Claude-kutsujen välillä – estää 429-virheet
-# Ilman taukoa retry vie 5-6 sek, tällä tauolla se on 2 sek → nopeampi
-CLAUDE_RATE_LIMIT_SLEEP = 2.0
+# Kategoriakohtaiset kynnykset: (min_profit_pct, min_profit_eur)
+CATEGORY_THRESHOLDS: dict[str, tuple[float, float]] = {
+    "elektroniikka": (60.0, 25.0),
+    "urheilu":       (40.0, 15.0),
+    "kodinkoneet":   (45.0, 20.0),
+    "muu":           (40.0, 15.0),
+}
+
+# Erätarjouksille kynnykset puolitetaan
+BULK_DIVISOR = 2.0
+
+
+def get_thresholds(category: str, is_bulk: bool) -> tuple[float, float]:
+    pct, eur = CATEGORY_THRESHOLDS.get(category, CATEGORY_THRESHOLDS["muu"])
+    if is_bulk:
+        pct = pct / BULK_DIVISOR
+        eur = eur / BULK_DIVISOR
+    return pct, eur
 
 
 def process_listing(listing, fetcher, analyzer, alerter, config) -> bool:
@@ -33,20 +54,26 @@ def process_listing(listing, fetcher, analyzer, alerter, config) -> bool:
         else "?"    if listing["price"] < 0
         else        f"{listing['price']}€"
     )
-    logger.info(f"    📦 [{price_display}] {listing['title'][:70]}")
-
-    # Pieni tauko ennen Claude-kutsua – välttää 429 rate limit -virheet
-    time.sleep(CLAUDE_RATE_LIMIT_SLEEP)
+    bulk_tag = " 📦[ERÄTARJOUS]" if listing.get("is_bulk") else ""
+    logger.info(f"    📦 [{price_display}] {listing['title'][:70]}{bulk_tag}")
 
     analysis = analyzer.analyze(listing)
     if not analysis:
         logger.warning("       ⚠️  AI-analyysi epäonnistui, ohitetaan")
         return False
 
+    category  = analysis.get("product_category", "muu")
+    is_bulk   = listing.get("is_bulk", False)
+    min_pct, min_eur = get_thresholds(category, is_bulk)
+
+    tori_info = ""
+    if analysis.get("tori_market_data"):
+        d = analysis["tori_market_data"]
+        tori_info = f" | Tori.fi mediaani: {d['median']}€ ({d['count']} ilm.)"
+
     logger.info(
-        f"       🤖 Kunto: {analysis['condition_score']}/5 | "
-        f"Arvioitu myynti: {analysis['estimated_resale_price']}€ | "
-        f"{analysis['product_name_normalized']}"
+        f"       🤖 [{category}] Kunto: {analysis['condition_score']}/5 | "
+        f"Arvioitu myynti: {analysis['estimated_resale_price']}€{tori_info}"
     )
 
     if analysis["condition_score"] <= 1:
@@ -63,19 +90,23 @@ def process_listing(listing, fetcher, analyzer, alerter, config) -> bool:
     if buy_price == 0 and resale_price >= 20:
         profit_pct, should_alert = 9999.0, True
     elif buy_price > 0 and resale_price > buy_price:
-        profit_pct   = (resale_price - buy_price) / buy_price * 100
-        abs_profit   = resale_price - buy_price
-        should_alert = (profit_pct >= config.min_profit_pct and abs_profit >= config.min_profit_eur)
+        profit_pct = (resale_price - buy_price) / buy_price * 100
+        abs_profit = resale_price - buy_price
+        should_alert = (profit_pct >= min_pct and abs_profit >= min_eur)
     else:
         profit_pct, should_alert = 0.0, False
+
+    threshold_info = f"kynnys {min_pct:.0f}%/{min_eur:.0f}€"
+    if is_bulk:
+        threshold_info += " (erätarjous, puolitettu)"
 
     if should_alert:
         alerter.send(listing, analysis, new_price_data, profit_pct)
         tag = "ILMAINEN 🎁" if profit_pct >= 9999 else f"+{profit_pct:.0f}%"
-        logger.info(f"       🚨 HÄLYTYS LÄHETETTY [{tag}]")
+        logger.info(f"       🚨 HÄLYTYS [{tag}] ({threshold_info})")
         return True
     else:
-        logger.info(f"       ✅ Ei riittävää potentiaalia ({profit_pct:.0f}%), ohitetaan")
+        logger.info(f"       ✅ Ei riittävää potentiaalia ({profit_pct:.0f}%, {threshold_info})")
         return False
 
 
@@ -88,10 +119,12 @@ def main():
     analyzer = ListingAnalyzer(config)
     alerter  = AlertSender(config)
 
-    logger.info("🔍 Toripotti käynnistyy...")
+    logger.info("🔍 Toripotti v5 käynnistyy...")
+    logger.info("📊 Kynnykset: elektroniikka 60%/25€ | urheilu 40%/15€ | muu 40%/15€")
+    logger.info("📦 Erätarjoukset: kynnys puolitetaan automaattisesti")
 
     emails = reader.fetch_unread_tori_emails()
-    logger.info(f"📬 Löytyi {len(emails)} käsittelemätöntä hakuvahti-emailiä")
+    logger.info(f"📬 Löytyi {len(emails)} käsittelemätöntä emailiä")
 
     if not emails:
         logger.info("Ei uusia emailejä. Lopetetaan.")
@@ -109,7 +142,7 @@ def main():
             total_listings += len(listings)
 
             if not listings:
-                logger.warning("  ⚠️  Ei ilmoituksia parsittu tästä emailista")
+                logger.warning("  ⚠️  Ei ilmoituksia parsittu")
                 continue
 
             for listing in listings:
