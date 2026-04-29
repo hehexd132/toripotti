@@ -1,8 +1,7 @@
 """
 Tori.fi hakuvahti -emailin parsija.
-
-KORJAUS: URL-deduplikointi – sama ilmoitus ei enää analysoida kahdesti
-vaikka linkki esiintyisi emailissa sekä kuvana että tekstinä.
+- URL-deduplikointi
+- Erätunnistus: "2 kpl", "setti", "paketti" jne.
 """
 import re
 import logging
@@ -29,10 +28,22 @@ SKIP_RE  = re.compile(
     re.IGNORECASE,
 )
 
+# Erätunnistus
+BULK_RE = re.compile(
+    r"\b([2-9]|1[0-9])\s*kpl\b"
+    r"|\bpari\b|\bsetti\b|\bset\b|\bpaketti\b|\berä\b"
+    r"|\b(kaksi|kolme|neljä|viisi|kuusi)\b"
+    r"|\b[2-9]x\b",
+    re.IGNORECASE,
+)
+
 
 def _normalize_url(url: str) -> str:
-    """Poistaa tracking-parametrit URL:sta deduplikointia varten."""
     return url.split("?")[0].split("#")[0].rstrip("/")
+
+
+def _detect_bulk(text: str) -> bool:
+    return bool(BULK_RE.search(text))
 
 
 class ToriEmailParser:
@@ -47,33 +58,22 @@ class ToriEmailParser:
         subject = email_data.get("subject", "")
 
         listings = []
-
         if html:
             listings = self._from_html_multi(html)
-
         if not listings and text:
             listings = self._from_text_multi(text)
-
         if not listings:
             single = self._single_fallback(html or text, subject)
             if single:
                 listings = [single]
 
-        count = len(listings)
-        logger.info(f"  📋 Emailissa {count} ilmoitusta")
+        logger.info(f"  📋 Emailissa {len(listings)} ilmoitusta")
         return listings
-
-    # ── HTML ──────────────────────────────────────────────────────────────
 
     def _from_html_multi(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "html.parser")
-
-        # Kerää UNIIKIT tori.fi-ilmoituslinkit
-        # Sama ilmoitus voi esiintyä sekä kuvalinkkinä että tekstilinkkinä –
-        # deduplikointi estää kaksinkertaisen analysoinnin
         seen_urls  = set()
         tori_links = []
-
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if "tori.fi" in href and re.search(r"/\d{5,}|/ilmoitus", href):
@@ -81,20 +81,12 @@ class ToriEmailParser:
                 if base not in seen_urls:
                     seen_urls.add(base)
                     tori_links.append((a, href))
-                # else: sama URL jo listassa, ohitetaan
-
-        if not tori_links:
-            return []
 
         listings = []
         for anchor, url in tori_links:
             listing = self._extract_near_link(anchor, url)
             if listing and listing.get("title"):
                 listings.append(listing)
-                p = listing["price"]
-                price_str = "ILMAINEN" if p == 0 else ("?" if p < 0 else f"{p}€")
-                logger.debug(f"    → [{price_str}] {listing['title'][:60]}")
-
         return listings
 
     def _extract_near_link(self, anchor, url: str) -> dict | None:
@@ -107,167 +99,113 @@ class ToriEmailParser:
             if parent is None or parent.name in ("body", "html", "[document]"):
                 break
             container = parent
-
             block_text = container.get_text(separator="\n", strip=True)
-            lines = [
-                l.strip() for l in block_text.split("\n")
-                if l.strip() and len(l.strip()) > 2
-            ]
-
+            lines = [l.strip() for l in block_text.split("\n") if l.strip() and len(l.strip()) > 2]
             if len(lines) < 2:
                 continue
 
             for line in lines:
                 ll = line.lower()
-
                 if price is None:
                     if FREE_RE.search(line):
                         price = 0
                     else:
                         m = PRICE_RE.search(line)
                         if m:
-                            raw = m.group(1).replace("\u00a0", "").replace(" ", "")
                             try:
-                                price = int(raw)
+                                price = int(m.group(1).replace("\u00a0", "").replace(" ", ""))
                             except ValueError:
                                 pass
-
                 if location is None:
                     for city in TURKU_AREA:
                         if city in ll:
-                            location = line
-                            break
-
+                            location = line; break
                 if title is None:
                     if not SKIP_RE.search(line) and not re.match(r"^[\d\s€,\.\-–]+$", line):
                         if len(line) > 4 and "@" not in line:
-                            title = line
-                            continue
-
+                            title = line; continue
                 if title and not description and line != title:
                     if not re.match(r"^[\d\s€,\.\-–]+$", line) and "@" not in line:
                         description = line
-
             if title and price is not None:
                 break
 
         if not title:
             return None
-
+        combined = f"{title} {description}"
         return {
-            "title":       title,
-            "price":       price if price is not None else -1,
-            "location":    location or "Turku-alue",
-            "description": description,
-            "url":         url,
+            "title": title, "price": price if price is not None else -1,
+            "location": location or "Turku-alue", "description": description,
+            "url": url, "is_bulk": _detect_bulk(combined),
         }
 
-    # ── Teksti-email ──────────────────────────────────────────────────────
-
     def _from_text_multi(self, text: str) -> list[dict]:
-        raw_urls = TORI_URL.findall(text)
-        segments = re.split(r"https?://(?:www\.)?tori\.fi/[^\s]+", text)
-
+        raw_urls  = TORI_URL.findall(text)
+        segments  = re.split(r"https?://(?:www\.)?tori\.fi/[^\s]+", text)
         seen_urls = set()
         listings  = []
-
         for i, url in enumerate(raw_urls):
             base = _normalize_url(url)
             if base in seen_urls:
                 continue
             seen_urls.add(base)
-
             segment = segments[i] if i < len(segments) else ""
             lines   = [l.strip() for l in segment.split("\n") if l.strip() and len(l.strip()) > 2]
-
             title = price = location = None
-
             for line in reversed(lines[-12:]):
                 ll = line.lower()
-
                 if price is None:
-                    if FREE_RE.search(line):
-                        price = 0
+                    if FREE_RE.search(line): price = 0
                     else:
                         m = PRICE_RE.search(line)
                         if m:
-                            raw = m.group(1).replace("\u00a0", "").replace(" ", "")
-                            try:
-                                price = int(raw)
-                            except ValueError:
-                                pass
-
+                            try: price = int(m.group(1).replace("\u00a0", "").replace(" ", ""))
+                            except ValueError: pass
                 if location is None:
                     for city in TURKU_AREA:
-                        if city in ll:
-                            location = line
-                            break
-
+                        if city in ll: location = line; break
                 if title is None:
                     if not SKIP_RE.search(line) and not re.match(r"^[\d\s€,\.\-–]+$", line):
-                        if len(line) > 4 and "@" not in line:
-                            title = line
-
+                        if len(line) > 4 and "@" not in line: title = line
             if title:
                 listings.append({
-                    "title":       title,
-                    "price":       price if price is not None else -1,
-                    "location":    location or "Turku-alue",
-                    "description": "",
-                    "url":         url,
+                    "title": title, "price": price if price is not None else -1,
+                    "location": location or "Turku-alue", "description": "",
+                    "url": url, "is_bulk": _detect_bulk(title),
                 })
-
         return listings
 
-    # ── Fallback ──────────────────────────────────────────────────────────
-
     def _single_fallback(self, content: str, subject: str) -> dict | None:
-        if not content:
-            return None
+        if not content: return None
         soup  = BeautifulSoup(content, "html.parser") if "<" in content else None
         text  = soup.get_text(separator="\n") if soup else content
         url_m = TORI_URL.search(content)
         url   = url_m.group(0) if url_m else None
-
         lines = [l.strip() for l in text.split("\n") if l.strip() and len(l.strip()) > 2]
         title = price = location = None
         desc  = []
-
         for line in lines:
             ll = line.lower()
             if price is None:
-                if FREE_RE.search(line):
-                    price = 0
+                if FREE_RE.search(line): price = 0
                 else:
                     m = PRICE_RE.search(line)
                     if m:
-                        raw = m.group(1).replace("\u00a0", "").replace(" ", "")
-                        try:
-                            price = int(raw)
-                        except ValueError:
-                            pass
+                        try: price = int(m.group(1).replace("\u00a0", "").replace(" ", ""))
+                        except ValueError: pass
             if location is None:
                 for city in TURKU_AREA:
-                    if city in ll:
-                        location = line; break
+                    if city in ll: location = line; break
             if title is None:
                 if not SKIP_RE.search(line) and not re.match(r"^[\d\s€,\.\-–]+$", line):
-                    if len(line) > 4 and "@" not in line:
-                        title = line; continue
-            if title and len(desc) < 3:
-                desc.append(line)
-
+                    if len(line) > 4 and "@" not in line: title = line; continue
+            if title and len(desc) < 3: desc.append(line)
         cleaned = re.sub(r"(?i)tori\.fi\s*[-|:]*\s*|hakuvahti\s*[-|:]*\s*", "", subject).strip()
-        if not title and len(cleaned) > 3:
-            title = cleaned
-
-        if not title:
-            return None
-
+        if not title and len(cleaned) > 3: title = cleaned
+        if not title: return None
+        combined = f"{title} {' '.join(desc)}"
         return {
-            "title":       title,
-            "price":       price if price is not None else -1,
-            "location":    location or "Turku-alue",
-            "description": " ".join(desc),
-            "url":         url,
+            "title": title, "price": price if price is not None else -1,
+            "location": location or "Turku-alue", "description": " ".join(desc),
+            "url": url, "is_bulk": _detect_bulk(combined),
         }
