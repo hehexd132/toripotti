@@ -1,10 +1,9 @@
 """
 AI-analysaattori – Claude Haiku + tori.fi oikeat markkinahinnat.
 
-UUTTA:
-- Hakee käytetyn hinnan tori.fi:stä (realistisin lähde)
-- Kategoriakohtainen prompt – Claude tietää kategorian kontekstin
-- 2 sek tauko ennen API-kutsua välttää 429-virheet
+KORJAUKSET:
+- condition_score None ei kaada ohjelmaa
+- Tiukempi JSON-validointi ennen int()-muunnosta
 """
 import json
 import logging
@@ -34,42 +33,38 @@ TÄRKEÄÄ OHJEISTUS KATEGORIAN MUKAAN:
 
 Palauta AINOASTAAN validi JSON – ei markdown, ei muuta tekstiä:
 {{
-  "product_name_normalized": "standardoitu hakulauseke hakua varten, esim. 'iPhone 12 mini 64GB' tai 'Trek FX3'",
-  "product_category": "elektroniikka" | "urheilu" | "kodinkoneet" | "muu",
-  "condition_score": <1–5: 1=rikki, 2=huono, 3=toimiva, 4=hyvä, 5=erinomainen>,
-  "condition_reasoning": "1–2 lausetta",
-  "estimated_resale_price": <realistinen myyntihinta tori.fi:ssä nyt, kokonaisluku euroina>,
-  "resale_reasoning": "1–2 lausetta – kerro perustuuko tori.fi-dataan vai omaan arvioon"
+  "product_name_normalized": "standardoitu hakulauseke, esim. 'iPhone 12 mini 64GB'",
+  "product_category": "elektroniikka" tai "urheilu" tai "kodinkoneet" tai "muu",
+  "condition_score": <kokonaisluku 1-5, EI null>,
+  "condition_reasoning": "1-2 lausetta",
+  "estimated_resale_price": <kokonaisluku euroina, EI null>,
+  "resale_reasoning": "1-2 lausetta"
 }}\
 """
 
-# Ohjeet kategoriakohtaisesti
 CATEGORY_GUIDANCE = {
     "elektroniikka": (
-        "Elektroniikka (erit. Apple-tuotteet): Ole KONSERVATIIVINEN hinta-arviossa. "
-        "Käytetty iPhone tai MacBook myy hitaasti ja hinta laskee jatkuvasti. "
-        "Käytä tori.fi markkinadataa ensisijaisesti – se kertoo todellisen myyntihinnan. "
-        "Älä yliarvioi. Mieluummin liian matala kuin liian korkea arvio."
+        "Ole KONSERVATIIVINEN. Käytetty iPhone/MacBook/Samsung myy hitaasti "
+        "ja hinta laskee jatkuvasti. Käytä tori.fi-dataa ensisijaisesti. "
+        "Älä yliarvioi – mieluummin matala kuin korkea."
     ),
     "urheilu": (
-        "Urheiluvälineet: Pyörät, kuntosalilaitteet, ulkoiluvarusteet myyvät hyvin. "
-        "Merkkituotteet (Trek, Specialized, Garmin, Suunto) pitävät arvonsa. "
-        "Voit olla realistisen optimistinen hyvässä kunnossa olevista merkkituotteista."
+        "Urheiluvälineet myyvät hyvin. Merkkituotteet (Trek, Specialized, "
+        "Garmin, Suunto) pitävät arvonsa. Voit olla realistisen optimistinen."
     ),
     "kodinkoneet": (
-        "Kodinkoneet: Käytetyt kodinkoneet myyvät nopeasti jos hinta on oikea. "
-        "Ole realistinen – toimivuus ja ikä ratkaisevat enemmän kuin brändi."
+        "Toimivuus ja ikä ratkaisevat. Ole realistinen."
     ),
     "muu": (
-        "Muut tuotteet: Arvioi realistisesti tori.fi-datan perusteella. "
-        "Jos ei markkinadataa, käytä omaa tietämystäsi varovaisesti."
+        "Arvioi realistisesti tori.fi-datan perusteella."
     ),
 }
 
 
 class ListingAnalyzer:
     MODEL      = "claude-haiku-4-5-20251001"
-    MAX_TOKENS = 600
+    MAX_TOKENS = 500
+    SLEEP_SECS = 3.5   # Pidempi tauko → vähemmän 429-virheitä
 
     def __init__(self, config):
         self.client       = anthropic.Anthropic(api_key=config.anthropic_api_key)
@@ -82,13 +77,13 @@ class ListingAnalyzer:
             else f"{listing['price']}€"
         )
 
-        # Hae tori.fi markkinahinnat
         title       = listing.get("title", "")
-        tori_data   = self.tori_fetcher.fetch(title, max_price=listing["price"] * 3 if listing["price"] > 0 else None)
-        tori_market = self._format_tori_data(tori_data)
-
-        # Arvaa kategoria otsikosta ennen AI-kutsua → parempi ohjeistus
-        pre_category = self._guess_category(title)
+        tori_data   = self.tori_fetcher.fetch(
+            title,
+            max_price=listing["price"] * 3 if listing["price"] > 0 else None,
+        )
+        tori_market   = self._format_tori_data(tori_data)
+        pre_category  = self._guess_category(title)
 
         prompt = PROMPT.format(
             title             = title[:120],
@@ -99,8 +94,8 @@ class ListingAnalyzer:
             category_guidance = CATEGORY_GUIDANCE.get(pre_category, CATEGORY_GUIDANCE["muu"]),
         )
 
-        # Tauko ennen API-kutsua – välttää 429-virheet
-        time.sleep(2.0)
+        # Tauko ennen API-kutsua
+        time.sleep(self.SLEEP_SECS)
 
         try:
             response = self.client.messages.create(
@@ -112,15 +107,34 @@ class ListingAnalyzer:
             raw  = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
             data = json.loads(raw)
 
-            for key in ("product_name_normalized", "condition_score", "estimated_resale_price"):
+            # Validoi ja muunna kentät turvallisesti
+            required = ("product_name_normalized", "condition_score", "estimated_resale_price")
+            for key in required:
                 if key not in data:
                     logger.error(f"AI-vastaus puuttuu kenttä: {key}")
                     return None
 
-            data["condition_score"]        = int(data["condition_score"])
-            data["estimated_resale_price"] = int(data["estimated_resale_price"])
+            # Turvallinen int-muunnos – None tai virheellinen arvo → hylkää
+            try:
+                cs = data["condition_score"]
+                data["condition_score"] = int(cs) if cs is not None else None
+                if data["condition_score"] is None:
+                    logger.error("condition_score on null")
+                    return None
+            except (TypeError, ValueError):
+                logger.error(f"condition_score ei ole numero: {data['condition_score']}")
+                return None
 
-            # Tallenna tori-data tulokseen (näkyy hälytyksessä)
+            try:
+                rp = data["estimated_resale_price"]
+                data["estimated_resale_price"] = int(rp) if rp is not None else None
+                if data["estimated_resale_price"] is None:
+                    logger.error("estimated_resale_price on null")
+                    return None
+            except (TypeError, ValueError):
+                logger.error(f"estimated_resale_price ei ole numero: {data['estimated_resale_price']}")
+                return None
+
             data["tori_market_data"] = tori_data
             return data
 
@@ -133,8 +147,6 @@ class ListingAnalyzer:
         except Exception as exc:
             logger.error(f"Analyysivirhe: {exc}", exc_info=True)
             return None
-
-    # ── Apumetodit ────────────────────────────────────────────────────────
 
     @staticmethod
     def _format_tori_data(data: dict | None) -> str:
@@ -149,22 +161,24 @@ class ListingAnalyzer:
     def _guess_category(title: str) -> str:
         t = title.lower()
         if any(w in t for w in [
-            "iphone", "ipad", "macbook", "samsung", "huawei", "pixel", "xiaomi",
-            "sony", "laptop", "kannettava", "tabletti", "puhelin", "tietokone",
-            "airpods", "kuulokkeet", "näyttö", "monitor", "gpu", "cpu", "ps5",
-            "playstation", "xbox", "nintendo", "kamera", "objektiivi",
+            "iphone", "ipad", "macbook", "imac", "samsung", "huawei", "pixel", "xiaomi",
+            "oneplus", "sony", "laptop", "kannettava", "tabletti", "puhelin", "tietokone",
+            "airpods", "kuulokkeet", "näyttö", "monitor", "gpu", "cpu", "rtx", "rx ",
+            "ps5", "playstation", "xbox", "nintendo", "kamera", "objektiivi", "pelikone",
+            "näytönohjain", "prosessori", "emolevy", "focusrite", "plotteri", "tulostin",
+            "apple watch", "älykello",
         ]):
             return "elektroniikka"
         if any(w in t for w in [
-            "pyörä", "polkupyörä", "fillari", "maastopyörä", "juoksukengät",
-            "kuntosali", "treeni", "urheilu", "tennis", "golf", "sukset",
-            "lumilaudat", "garmin", "suunto", "polar", "fitbit",
-            "sähköpyörä", "skeittilauta", "sup", "kajak",
+            "pyörä", "polkupyörä", "fillari", "maastopyörä", "sähköpyörä",
+            "juoksukengät", "kuntosali", "treeni", "tennis", "golf",
+            "sukset", "lumilaudat", "garmin", "suunto", "polar", "fitbit",
+            "skeittilauta", "sup", "kajak", "urheil",
         ]):
             return "urheilu"
         if any(w in t for w in [
             "pyykinpesukone", "kuivausrumpu", "astianpesukone", "jääkaappi",
-            "pakastin", "liesi", "uuni", "mikroaaltouuni", "imuri", "robotti-imuri",
+            "pakastin", "liesi", "uuni", "mikroaaltouuni", "imuri",
         ]):
             return "kodinkoneet"
         return "muu"
